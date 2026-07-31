@@ -23,11 +23,17 @@ knn_eval_core.py          Everything shared by every k-NN experiment: split buil
 eval_knn_clap.py          Thin backbone definitions. One file per model, ~40 lines each.
 eval_knn_ast.py
 eval_knn_whisper.py
+eval_prune_clap.py        Structured-pruning sweep of the CLAP audio tower (see below).
+analyze_prune.py          Turns the sweep CSVs into figures/ (see below).
 scripts/knn-*.sh          Slurm batch scripts, one per backbone.
+scripts/prune-CLAP.sh     Slurm batch script for the pruning sweep.
+scripts/analyze-prune.sh  Slurm batch script for the figures (CPU only).
 dataset/*.jsonl           Per-dataset manifests (the data contract, see below).
 dataset/preprocess_*.py   One-off scripts that built those manifests from raw archives.
 dataset/stratify.py       Helper to add stratified train/test splits to a manifest.
 results/knn_*.json        Machine-readable results, one file per backbone.
+results/prune_*.csv       One row per (dataset, pruned unit) from the pruning sweep.
+figures/<sweep>/          Generated figures + ranked unit table. Never edited by hand.
 ```
 
 Audio itself is **not** in this repo. Manifests point at absolute paths under
@@ -228,6 +234,104 @@ AST wins on 9 of 10 datasets. The ordering tracks pretraining objective: AudioSe
 supervision (which includes cough, breathing, and heartbeat classes) transfers best,
 contrastive audio-text next, speech transcription worst — Whisper is trained to discard
 exactly the non-speech texture these tasks depend on.
+
+---
+
+## Structured pruning sweep (`eval_prune_clap.py`)
+
+Which parts of CLAP's audio tower actually carry the pathology signal? The sweep ablates
+one structural unit at a time from the HTSAT encoder, re-embeds every recording with the
+crippled model, and re-runs the same k-NN probe. The drop in AUROC relative to the intact
+model is that unit's contribution.
+
+```bash
+sbatch scripts/prune-CLAP.sh --prune_type none     # intact reference row
+sbatch scripts/prune-CLAP.sh --prune_type block    # 12 blocks
+sbatch scripts/prune-CLAP.sh --prune_type head     # 184 heads
+```
+
+`laion/clap-htsat-unfused` is a Swin-style HTSAT: 4 stages of depth `[2, 2, 6, 2]` with
+`[4, 8, 16, 32]` heads per stage — **12 blocks, 184 heads**. Ablations are always
+single-unit, never cumulative; the model is reloaded conceptually intact for each row.
+
+**Pruning is masking, not surgery.** A head is removed by zeroing its slice of the
+self-attention context; a block is removed by replacing it with the identity, so its
+residual stream passes through untouched. Weights are never modified, so one in-memory
+model serves the whole sweep and every configuration is exactly reversible (verified: the
+`none` config and the post-restore forward are bit-identical to the unpruned model).
+
+> Do **not** reach for `attention.prune_heads()` here. Swin-family attention keeps a
+> `relative_position_bias_table` sized by head count, and the HF implementation does not
+> shrink it, so real head surgery crashes with a shape mismatch. Zeroing the context
+> slice was verified bit-identical to zeroing that head's rows of the value projection,
+> which is what removing the head means.
+
+Block ablation removes attention **and** the MLP of that block. It is therefore strictly
+stronger than zeroing all heads of the same block, which leaves the MLP running.
+
+**Cost.** The sweep re-embeds the same audio 184 times, so decoded and feature-extracted
+inputs are cached in RAM once per dataset (~250 KB/recording; the largest dataset is
+under 1 GB) and only the GPU forward is repeated. Even so the full head sweep is roughly
+1.5 h on one A100 — longer than a single comfortable walltime. Re-submit the same command
+with `--resume` and it reads the CSV back, skips every `(dataset, pruning_index)` pair
+already recorded, and continues:
+
+```bash
+sbatch --time=01:00:00 --mem=20G scripts/prune-CLAP.sh --prune_type head --resume --batch-size 64
+```
+
+Rows are flushed as they land, so a job killed by the walltime loses nothing. Peak RSS is
+~3.3 GB; 20 GB is ample.
+
+### `results/prune_clap_<prune_type>_<pooling>_seed<seed>.csv`
+
+One row per (dataset, ablated unit). AUROC is the headline metric because these datasets
+are heavily imbalanced, and it is threshold-free — accuracy would mostly track the
+positive rate.
+
+| column | meaning |
+|---|---|
+| `dataset` | Config name, e.g. `KAUH`. |
+| `seed` | Seed set for `random`/`numpy`/`torch`. Nothing here is stochastic; the column keeps the CSV self-describing. |
+| `pruning_type` | `head`, `block`, or `none`. |
+| `pruning_index` | Position in the sweep, `0..183` / `0..11`; `-1` for `none`. |
+| `pruning_id` | Human-readable unit, `s2.b4.h12` = stage 2, block 4, head 12. |
+| `pooling` | `projected` (512-d, shared audio/text space) or `pooled` (768-d, pre-projection). |
+| `AUROC` | k-NN AUROC on the test split with that unit removed. |
+
+Compare against the `--prune_type none` row of the same `(dataset, pooling, seed)`.
+
+### Figures (`analyze_prune.py`)
+
+```bash
+sbatch scripts/analyze-prune.sh --formats png pdf
+```
+
+CPU only, ~30 s, no GPU. Every `results/prune_clap_*.csv` is discovered automatically,
+matched to the `none` reference of the same `(pooling, seed)`, and rendered into
+`figures/<prune_type>_<pooling>_seed<seed>/`. Add a block sweep later and its folder
+appears on the next run with no code change — dense sweeps get the line/heatmap
+treatment, sweeps of ≤ 20 units get labelled bars.
+
+| figure | what it answers |
+|---|---|
+| `01_baseline_auroc` | How good is the intact model on each dataset? |
+| `02_effect_heatmap` | The whole sweep at once — dataset × unit. |
+| `03_mean_effect` | Mean effect per unit, every dataset's own value behind it. |
+| `04_effect_by_block` | Where in the network sensitivity concentrates. |
+| `05_per_dataset_profiles` | Do the datasets agree at all? |
+| `06_extreme_units` | The extremes, with per-dataset dots as a consistency check. |
+| `unit_effects.csv` | Ranked mean/std/worst/best effect per unit. |
+
+Everything is plotted as `AUROC(pruned) − AUROC(intact)`, on a diverging scale with a
+neutral midpoint: red = removing it hurts, blue = removing it helps.
+
+**Read these with the noise in mind.** There is one measurement per (dataset, unit) —
+no repeats, no confidence intervals — so figure 03 draws a ±1 MAD band and figure 06
+plots each dataset as its own dot. A bar whose dots straddle zero is noise, not a
+finding. The one effect that survives that scepticism in the head sweep is structural:
+in figure 04 the block `s1.b0` is the only one of the twelve whose median effect — and
+whole interquartile box — sits below zero. Every other block's median is at or above it.
 
 ---
 
