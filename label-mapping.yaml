@@ -19,12 +19,12 @@ datasets:
       Present: 1
       # Unknown is intentionally excluded
   
-  - name: CoughVID
-    path: dataset/coughvid.jsonl
-    label_map:
-      healthy: 0
-      COVID-19: 1
-      symptomatic: 1
+  # - name: CoughVID
+  #   path: dataset/coughvid.jsonl
+  #   label_map:
+  #     healthy: 0
+  #     COVID-19: 1
+  #     symptomatic: 1
   
   # - name: FSD50k
   #   path: dataset/fsd50k.jsonl
@@ -32,15 +32,15 @@ datasets:
   #     Electric_guitar: 0
   #     Male_speech_and_man_speaking: 1
 
-  - name: HF_Lung
-    path: dataset/hf_lung.jsonl
-    label_map:
-      nan: 0
-      healthy: 0
-      Rhonchi: 1
-      Wheeze: 1
-      Stridor: 1
-      Both: 1
+  # - name: HF_Lung
+  #   path: dataset/hf_lung.jsonl
+  #   label_map:
+  #     nan: 0
+  #     healthy: 0
+  #     Rhonchi: 1
+  #     Wheeze: 1
+  #     Stridor: 1
+  #     Both: 1
 
   - name: ICBHI
     path: dataset/icbhi.jsonl
@@ -70,14 +70,14 @@ datasets:
       DAS: 1
       CAS & DAS: 1
   
-  - name: TR
-    path: dataset/tr.jsonl
-    label_map:
-      COPD0: 0
-      COPD1: 1
-      COPD2: 1
-      COPD3: 1
-      COPD4: 1
+  # - name: TR
+  #   path: dataset/tr.jsonl
+  #   label_map:
+  #     COPD0: 0
+  #     COPD1: 1
+  #     COPD2: 1
+  #     COPD3: 1
+  #     COPD4: 1
 
   - name: ZCHSound
     path: dataset/zchsound.jsonl
