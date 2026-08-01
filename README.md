@@ -335,6 +335,170 @@ whole interquartile box — sits below zero. Every other block's median is at or
 
 ---
 
+## The regularisation control (`eval_control_clap.py`)
+
+Removing a head does two things at once: it destroys that head's *specific arrangement*
+of weights, and it perturbs the network in a generic, capacity-shrinking,
+regularisation-flavoured way. A gain from pruning is only interesting if it is the first.
+This experiment separates them by leaving the head in place and disturbing only it.
+
+```bash
+sbatch scripts/control-CLAP.sh                  # 7 datasets x 6 heads x 21 runs = 889 evals
+sbatch scripts/control-CLAP.sh --resume         # continue after a walltime cut
+sbatch scripts/analyze-control.sh --formats png pdf
+```
+
+| condition | what happens to the head | what it isolates |
+|---|---|---|
+| `intact` | nothing (one reference row per dataset) | baseline |
+| `removed` | attention context zeroed, exactly as in the sweep | the claimed gain |
+| `shuffled` ×10 | its own weights permuted **among themselves** | arrangement destroyed; count, magnitudes, location preserved |
+| `noise` ×10 | Gaussian noise added, σ = each tensor slice's own std | arrangement preserved; matched-scale perturbation |
+
+A "head" here is all of its parameters: its rows of Q/K/V (weights **and** biases), its
+columns of the attention output projection, and its column of the relative-position-bias
+table — 18,729 parameters for a stage-1 head. Shuffling is verified to preserve the exact
+sorted multiset of every one of those 8 tensors, and every mutation is restored
+bit-exactly afterwards, so one in-memory model serves the whole experiment.
+
+Heads are selected **per dataset** from the sweep CSV, because "helpful to remove" is a
+per-dataset property: top-3 by positive effect and top-3 by negative effect, fewer when
+fewer exist, none when a sign is absent. Trial seeds come from SHA-256 of
+`(seed, head, condition, trial)` — never Python's `hash()`, which is salted per process.
+
+### Result
+
+Mean ΔAUROC vs intact, over 7 datasets × 3 heads per side (each control condition
+averaged over its 10 draws first):
+
+| heads selected as | `removed` | `shuffled` | `noise` |
+|---|---|---|---|
+| helpful to remove | **+0.0348** | **+0.0292** | +0.0076 |
+| harmful to remove | **−0.0238** | **−0.0177** | +0.0026 |
+
+Head by head, `shuffled` tracks `removed` closely (r = +0.97, slope 0.85) while `noise`
+barely tracks it at all (r = +0.48, slope 0.18) — `figures/control_projected_seed42/03_control_vs_removal.png`.
+Shuffling lands on the same side of zero as removal for **98%** of the 42 (dataset, head)
+pairs; noise manages 64%, barely better than a coin.
+
+Scrambling a head's weights reproduces ~84% of the gain where removal helped and ~74% of
+the damage where removal hurt, in both directions. Matched-scale noise, which leaves the
+arrangement intact, reproduces ~22% and actually flips sign on the harmful side. The
+effect is specific to *how the weights are arranged*, not to perturbing the network.
+
+### Two caveats that bound the claim
+
+1. **The `removed` column is selection-biased.** These heads were chosen because their
+   removal moved test AUROC in the sweep, on the same test split — so that column carries
+   a winner's curse and overstates the true effect size. The `shuffled` and `noise`
+   columns are fresh measurements on already-chosen heads, so the decisive comparison —
+   `shuffled` vs `noise` — is *not* affected by the selection. Read the table as a
+   contrast between the two controls, not as an unbiased estimate of the pruning gain.
+2. **Noise at σ is a milder perturbation than removal.** On a probe batch, relative
+   embedding shift was 0.076 for noise against 0.119 for removal and 0.146 for shuffling.
+   So some of noise's smaller effect may be that it disturbs the representation less, not
+   only that it preserves arrangement. Closing that gap means scaling noise until its
+   representation shift matches removal's: `--noise-scale` does exactly this, and writes
+   its own CSV since the scale is part of the condition.
+
+---
+
+## What is special about these heads? (`eval_head_properties.py`)
+
+The sweep locates the heads and the control shows the effect is real and
+arrangement-specific. This asks what the heads *are*: measure standard properties of all
+184 and test which ones separate helpful-to-remove from harmful-to-remove.
+
+```bash
+sbatch scripts/head-properties-CLAP.sh          # ~3 min, one forward pass per corpus
+sbatch scripts/analyze-headprops.sh --formats png pdf
+```
+
+| property family | measures |
+|---|---|
+| static (weights only) | `w_norm`, `w_norm_qkv`, `w_norm_out`, `w_rms`, `w_kurtosis`, `w_participation`, `w_max_over_rms`, `ov_spectral` (spectral norm of the head's OV circuit `W_out[:,h] @ W_v[h,:]`) |
+| activation, per corpus | `ctx_rms` (context length per token), `contrib_rms` (length of what the head writes into the residual stream), `energy_share` (its share of the block's written energy) |
+| domain contrast | `generality` = general − medical energy share; `contrib_ratio` = log2(general / medical contribution) |
+
+Corpora: the seven medical test splits, plus **FSD50k as a general-audio probe** — CLAP's
+pretraining domain, and the point of the exercise.
+
+### Result: no property separates the two groups
+
+Per dataset (184 heads × 7 datasets), after z-scoring each property **within its stage**:
+every property has |mean ρ| ≤ 0.065 and AUC in 0.48–0.545, and **not one of the fourteen
+has a consistent sign across all seven datasets**. This is the "expected if noise" branch.
+
+Against the cross-dataset **mean** effect (less noisy target, so more power), one property
+does stand out, but not in the hypothesised way:
+
+| property | ρ (within stage) | p | p after Bonferroni ×14 |
+|---|---|---|---|
+| general-audio energy share | **+0.20** | 0.007 | 0.09 |
+| medical energy share | +0.17 | 0.020 | 0.28 |
+| log2(general / medical contribution) | −0.07 | 0.38 | 1.0 |
+| generality (general − medical share) | +0.02 | 0.76 | 1.0 |
+| every static weight property | \|ρ\| ≤ 0.06 | ≥ 0.43 | 1.0 |
+
+Read together, these say **loudness, not domain**. Heads that write more energy — on
+*either* corpus — are somewhat more likely to be worth removing, but the general-vs-medical
+*contrast* predicts nothing at all. Nothing survives correction for testing 14 properties.
+
+**And the smoking gun is not there because the ammunition is not there.** Across the 184
+heads, general-audio and medical energy share correlate at **r = 0.95**. CLAP's heads are
+essentially not domain-specialised in energy terms: there is no population of
+general-audio-only heads for the contrast to find. In the top-20 group profile the heads
+whose removal helps are, if anything, *relatively louder on medical audio than on general*
+(`03_group_profiles.png`) — the opposite of the "general-audio features mislead the
+medical probe" story.
+
+### Why this is not proof that head properties are irrelevant
+
+The target variable is noisy. Per-dataset single-head effects sit near the ±0.004 MAD
+noise floor established by the sweep, which attenuates every correlation toward zero. The
+control experiment showed the *extreme* heads' effects are real (shuffling reproduces
+removal at r = +0.97), so the honest conclusion is that **these standard descriptors fail
+to predict the effect at the signal-to-noise available** — not that no property could.
+A stronger test would need repeated-split effect estimates to raise the target's SNR.
+
+### Assumptions and design choices
+
+Everything here that was a judgement call rather than a given:
+
+1. **Split into two scripts**, `eval_head_properties.py` (measure → `results/head_*.csv`)
+   and `analyze_head_properties.py` (test + figures), matching the repo's eval/analyze
+   split rather than the single script suggested.
+2. **Activations need forward passes**, not the stored embeddings — an embedding carries
+   no per-head information. It stays cheap because all 184 heads are instrumented at once:
+   **one pass per corpus, 8 total, ~3 min**, versus 184 passes if done per head.
+3. **FSD50k is used as a probe corpus, not a task.** The path comes from
+   `label-mapping-FSD50k.yaml`, but its `label_map` (2 of ~200 classes) defines a binary
+   task; for a general-audio probe the breadth matters, so **all classes are kept**
+   (`--general-labels mapped` restores the 2-class version). Subsampled to 1000
+   recordings, deterministic under the seed. This is the one place FSD50k enters the
+   project despite the "excluded datasets" note below — as a probe stimulus, never as an
+   evaluation task.
+4. **Medical corpora are probed on the `test` split**, where the sweep effect was measured,
+   and the seven are averaged into one number per head.
+5. **A head's "activation" is defined twice**: the context it produces, and what it writes
+   into the residual stream (context × that head's columns of the output projection). The
+   latter is the meaningful one and is what `energy_share` uses.
+6. **`energy_share` normalises within the block**, which removes each corpus's overall
+   loudness and each stage's width and head count. It sums squared per-head norms, so it
+   ignores cross-head cancellation — a share, not an exact decomposition.
+7. **Within-stage z-scoring is the load-bearing control.** Head size, weight norm,
+   activation scale and pruning effect all vary by stage (`04_stage_confound.png`), so a
+   raw correlation can be nothing but "stage predicts both". Raw numbers are reported
+   alongside so the size of the confound stays visible.
+8. **Two target variables**: per-dataset effect (7 tests, honest about disagreement) and
+   the cross-dataset mean (more power, less detail). Both are reported.
+9. **Bonferroni correction over the 14 properties**, because this is a screen. The
+   uncorrected p = 0.007 is reported too, and neither is treated as a finding.
+10. **AUC groups** are the top/bottom 20 heads by effect (`--group-size`), an arbitrary
+    but pre-stated cut.
+
+---
+
 ## Final Remarks
 
 Following datasets should not be included in the experiments which are already excluded or commented out from the label-mapping.yaml:
