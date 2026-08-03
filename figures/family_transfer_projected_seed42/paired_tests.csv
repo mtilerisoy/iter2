@@ -1,0 +1,5 @@
+,wins,n,mean_gap,wilcoxon_p
+own_family vs other_family,4.0000,7.0000,-0.0097,0.6875
+own_family vs random,4.0000,7.0000,0.0017,0.9375
+other_family vs random,4.0000,7.0000,0.0114,0.5781
+universal vs random,2.0000,7.0000,-0.0081,0.4688

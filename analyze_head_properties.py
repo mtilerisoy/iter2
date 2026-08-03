@@ -370,6 +370,212 @@ def fig_stage_confound(features, sweep, out_dir, formats):
     save(fig, out_dir, "04_stage_confound", formats)
 
 
+# ------------------------------------------------- selected heads vs. everything else
+
+
+def per_dataset_features(static, activations, sweep, k):
+    """One row per (dataset, head): properties + which of the three groups it falls in.
+
+    The unit is (dataset, head), not head, for two reasons: "helpful to remove" is a
+    per-dataset property, and the medical activation statistics are per-corpus, so each
+    dataset gets its own. Two heads are in fact selected as helpful for one dataset and
+    harmful for another, which a per-head grouping could not represent.
+    """
+    general = (
+        activations[activations["domain"] == "general"]
+        .groupby("pruning_id")[["contrib_rms", "ctx_rms", "energy_share"]]
+        .mean()
+        .add_prefix("general_")
+    )
+    medical = activations[activations["domain"] == "medical"].rename(
+        columns={"corpus": "dataset"}
+    )[["dataset", "pruning_id", "contrib_rms", "ctx_rms", "energy_share"]]
+    medical = medical.rename(
+        columns={
+            "contrib_rms": "medical_contrib_rms",
+            "ctx_rms": "medical_ctx_rms",
+            "energy_share": "medical_energy_share",
+        }
+    )
+
+    frame = (
+        sweep[["dataset", "pruning_id", "effect"]]
+        .merge(medical, on=["dataset", "pruning_id"], how="inner")
+        .merge(general.reset_index(), on="pruning_id", how="left")
+        .merge(static, on="pruning_id", how="left")
+    )
+    frame["generality"] = frame["general_energy_share"] - frame["medical_energy_share"]
+    frame["contrib_ratio"] = np.log2(frame["general_contrib_rms"] / frame["medical_contrib_rms"])
+    frame = frame.rename(
+        columns={"medical_energy_share": "medical_share", "general_energy_share": "general_share"}
+    )
+
+    # Same selection rule as the control experiment: top-k of each sign, per dataset.
+    frame["group"] = "rest"
+    for dataset, group in frame.groupby("dataset"):
+        helps = group[group["effect"] > 0].nlargest(k, "effect").index
+        hurts = group[group["effect"] < 0].nsmallest(k, "effect").index
+        frame.loc[helps, "group"] = "helps"
+        frame.loc[hurts, "group"] = "hurts"
+    return frame
+
+
+def zscore_within(frame, properties, keys):
+    """Z-score inside (dataset, stage), so neither the corpus nor the stage explains it."""
+    out = frame.copy()
+    for column in properties:
+        grouped = out.groupby(keys)[column]
+        spread = grouped.transform("std").replace(0, np.nan)
+        out[column] = (out[column] - grouped.transform("mean")) / spread
+    return out
+
+
+def group_vs_rest(frame, properties, n_permutations, seed=0):
+    """Is each selected group distinct from the ordinary heads, property by property?
+
+    The null is "this property is unrelated to the pruning effect": for each draw, pick a
+    random k heads per dataset instead of the top-k, and recompute the same statistic.
+    That respects the design — same group sizes, same datasets, same stage mix on average
+    — and needs no independence assumption, which matters because the seven datasets share
+    the same 184 heads.
+    """
+    rng = np.random.default_rng(seed)
+    zed = zscore_within(frame, properties, ["dataset", "stage"])
+    datasets = sorted(zed["dataset"].unique())
+    # "either" pools both signs: it asks whether a head that matters *at all* differs
+    # from one that does not, which is a different question from which way it matters.
+    members = {
+        "helps": zed["group"] == "helps",
+        "hurts": zed["group"] == "hurts",
+        "either": zed["group"].isin(["helps", "hurts"]),
+    }
+    sizes = {
+        (dataset, group): int(((zed["dataset"] == dataset) & mask).sum())
+        for dataset in datasets
+        for group, mask in members.items()
+    }
+
+    records = []
+    for prop in properties:
+        column = zed[prop].to_numpy()
+        by_dataset = {d: np.flatnonzero((zed["dataset"] == d).to_numpy()) for d in datasets}
+
+        for group, membership in members.items():
+            mask = membership.to_numpy()
+            selected = column[mask]
+            others = column[(zed["group"] == "rest").to_numpy()]
+            if len(selected) == 0 or np.all(np.isnan(selected)):
+                continue
+
+            observed = float(np.nanmedian(selected))
+            delta = cliffs_delta(selected, others)
+
+            # Null distribution of the same median, over random selections of equal size.
+            draws = np.empty(n_permutations)
+            for i in range(n_permutations):
+                picked = np.concatenate(
+                    [
+                        rng.choice(by_dataset[d], size=sizes[(d, group)], replace=False)
+                        for d in datasets
+                        if sizes[(d, group)]
+                    ]
+                )
+                draws[i] = np.nanmedian(column[picked])
+            # Two-sided: how often is a random selection at least this extreme?
+            centre = np.nanmedian(draws)
+            p_value = float(
+                (np.abs(draws - centre) >= abs(observed - centre)).sum() + 1
+            ) / (n_permutations + 1)
+
+            records.append(
+                {
+                    "property": prop,
+                    "group": group,
+                    "n": int(np.isfinite(selected).sum()),
+                    "median_z": observed,
+                    "null_median_z": float(centre),
+                    "null_p05": float(np.nanpercentile(draws, 2.5)),
+                    "null_p95": float(np.nanpercentile(draws, 97.5)),
+                    "cliffs_delta": delta,
+                    "p_permutation": p_value,
+                }
+            )
+
+    result = pd.DataFrame(records)
+    result["p_bonferroni"] = (result["p_permutation"] * len(result)).clip(upper=1.0)
+    result["significant"] = result["p_bonferroni"] < 0.05
+    return result.sort_values("p_permutation")
+
+
+def cliffs_delta(a, b):
+    """P(a > b) - P(a < b): +1 = every selected head above every ordinary one, 0 = no shift."""
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if len(a) == 0 or len(b) == 0:
+        return np.nan
+    greater = float(sum((a[:, None] > b[None, :]).sum(axis=1)))
+    less = float(sum((a[:, None] < b[None, :]).sum(axis=1)))
+    return (greater - less) / (len(a) * len(b))
+
+
+def fig_group_vs_rest(contrast, frame, properties, out_dir, formats, k):
+    """Each selected group against the ordinary heads, with the random-selection band."""
+    order = (
+        contrast.groupby("property")["median_z"].apply(lambda v: v.abs().max())
+        .sort_values().index.tolist()
+    )
+    groups = [g for g in ("helps", "hurts", "either") if g in set(contrast["group"])]
+    titles_by_group = {
+        "helps": f"top-{k} heads whose removal HELPED",
+        "hurts": f"top-{k} heads whose removal HURT",
+        "either": "both groups pooled — heads that matter at all",
+    }
+    fig, axes = plt.subplots(1, len(groups), figsize=(6.0 * len(groups), 0.34 * len(order) + 2.6),
+                             sharey=True)
+
+    for ax, group, color in zip(np.atleast_1d(axes), groups,
+                                (HELPFUL_COLOR, HARMFUL_COLOR, SERIES)):
+        subset = contrast[contrast["group"] == group].set_index("property").reindex(order)
+        ypos = np.arange(len(order))
+        # What a random selection of the same size does — anything inside this band is
+        # indistinguishable from an ordinary head.
+        ax.barh(
+            ypos, subset["null_p95"] - subset["null_p05"], left=subset["null_p05"],
+            height=0.72, color=GRID, zorder=1,
+        )
+        ax.scatter(subset["median_z"], ypos, s=46, color=color, zorder=3)
+        for y, (value, marked) in enumerate(zip(subset["median_z"], subset["significant"])):
+            if marked:
+                ax.annotate("*", (value, y), textcoords="offset points", xytext=(0, 4),
+                            ha="center", fontsize=13, color=INK)
+        ax.axvline(0, color=AXIS, linewidth=1.0)
+        ax.set_yticks(ypos, [PROPERTY_LABELS.get(name, name) for name in order], fontsize=8.5)
+        ax.set_xlabel("median z-score within (dataset, stage)")
+        ax.set_title(f"{titles_by_group[group]}  (n={int(subset['n'].max())})",
+                     loc="left", fontsize=10)
+        style_axes(ax, grid_axis="x")
+
+    fig.legend(
+        handles=[
+            Line2D([], [], marker="o", linestyle="none", color=INK_SECONDARY, markersize=7,
+                   label="selected group median (coloured per panel)"),
+            Line2D([], [], color=GRID, linewidth=8, label="95% of random same-size selections"),
+            Line2D([], [], marker="$*$", linestyle="none", color=INK, markersize=9,
+                   label="significant after Bonferroni"),
+        ],
+        loc="lower left", bbox_to_anchor=(0.005, -0.02), ncol=3, fontsize=9,
+        labelcolor=INK_SECONDARY, frameon=False,
+    )
+    fig.suptitle("Are the selected heads distinguishable from ordinary heads?",
+                 x=0.005, y=0.995, ha="left", va="top", fontsize=12, fontweight="bold", color=INK)
+    fig.text(0.005, 0.945,
+             "0 = the average head of the same dataset and stage · a dot inside the grey band "
+             "is what chance already produces",
+             ha="left", va="top", fontsize=8.5, color=INK_MUTED)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.90))
+    save(fig, out_dir, "05_selected_vs_rest", formats)
+
+
 # ------------------------------------------------------------------------------- run
 
 
@@ -379,6 +585,9 @@ def main():
     parser.add_argument("--figures-dir", default="figures")
     parser.add_argument("--pooling", default="projected")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--select-k", type=int, default=3,
+                        help="Heads per sign per dataset for the selected-vs-rest contrast.")
+    parser.add_argument("--permutations", type=int, default=10000)
     parser.add_argument("--group-size", type=int, default=20,
                         help="Heads per side when forming the helpful/harmful contrast groups.")
     parser.add_argument("--formats", nargs="+", default=["png"])
@@ -426,7 +635,19 @@ def main():
     print(view[["property", "rho", "p_value", "p_bonferroni", "significant_corrected"]]
           .to_string(index=False, float_format=lambda v: f"{v:+.4f}"))
 
+    per_dataset = per_dataset_features(static, activations, sweep, args.select_k)
+    contrast = group_vs_rest(per_dataset, properties, args.permutations)
+    contrast.to_csv(out_dir / "selected_vs_rest.csv", index=False, float_format="%.6g")
+    counts = per_dataset["group"].value_counts()
+    print(f"\nSelected-vs-rest (top-{args.select_k} per sign per dataset): "
+          f"{counts.get('helps', 0)} helps, {counts.get('hurts', 0)} hurts, {counts.get('rest', 0)} rest "
+          f"(dataset, head) rows")
+    print(contrast[["property", "group", "median_z", "cliffs_delta", "p_permutation",
+                    "p_bonferroni", "significant"]]
+          .head(10).to_string(index=False, float_format=lambda v: f"{v:+.4f}"))
+
     fig_property_ranking(summary, out_dir, args.formats)
+    fig_group_vs_rest(contrast, per_dataset, properties, out_dir, args.formats, args.select_k)
     fig_generality_scatter(features, sweep, out_dir, args.formats)
     fig_group_profiles(features, sweep, out_dir, args.formats, args.group_size, properties)
     fig_stage_confound(features, sweep, out_dir, args.formats)

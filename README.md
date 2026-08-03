@@ -403,9 +403,9 @@ effect is specific to *how the weights are arranged*, not to perturbing the netw
 
 ---
 
-## What is special about these heads? (`eval_head_properties.py`)
+<!-- ## What is special about these heads? (`eval_head_properties.py`) -->
 
-The sweep locates the heads and the control shows the effect is real and
+<!-- The sweep locates the heads and the control shows the effect is real and
 arrangement-specific. This asks what the heads *are*: measure standard properties of all
 184 and test which ones separate helpful-to-remove from harmful-to-remove.
 
@@ -450,7 +450,81 @@ essentially not domain-specialised in energy terms: there is no population of
 general-audio-only heads for the contrast to find. In the top-20 group profile the heads
 whose removal helps are, if anything, *relatively louder on medical audio than on general*
 (`03_group_profiles.png`) — the opposite of the "general-audio features mislead the
-medical probe" story.
+medical probe" story. -->
+## What is special about these heads? (`eval_head_properties.py`)
+
+### The selected heads *are* distinct from ordinary heads
+
+Comparing helps-to-remove and hurts-to-remove against **each other** finds nothing.
+Comparing each against **the other 178 heads** does. Using the same selection rule as the
+control (top-3 of each sign, per dataset) and the unit that rule implies —
+(dataset, head), because two heads are helpful for one dataset and harmful for another —
+gives 21 helps rows, 21 hurts rows and 1246 rest rows. Each group's median is compared
+against the central 95% of 10,000 random selections of the same size, drawn per dataset,
+which needs no independence assumption:
+
+| group | property | median z | Cliff's δ | p (permutation) | p after Bonferroni ×42 |
+|---|---|---|---|---|---|
+| **either** | medical energy share | **+0.35** | +0.29 | 0.0002 | **0.008** ✓ |
+| **either** | medical contribution RMS | **+0.43** | +0.30 | 0.0010 | **0.042** ✓ |
+| **either** | general-audio energy share | **+0.20** | +0.24 | 0.0009 | **0.038** ✓ |
+| helps | general-audio energy share | +0.33 | +0.23 | 0.0040 | 0.17 |
+| hurts | medical contribution RMS | +0.47 | +0.43 | 0.0056 | 0.24 |
+| either | weight norm | −0.25 | −0.19 | 0.032 | 1.0 |
+
+**Heads that matter are louder than heads that don't — in either direction.** Pooling both
+signs (`either`, n=42) is what reaches significance, and the helps and hurts groups shift
+the *same* way on every activation measure. So activation magnitude predicts **whether a
+head matters at all**, not **which way it matters**. Cliff's δ ≈ +0.29 means a randomly
+chosen selected head is louder than a randomly chosen ordinary head about 65% of the time
+— a real but moderate separation, not a clean split.
+
+Neither group separately survives correction (n=21 each), and no static weight property
+survives in any grouping. This is consistent with everything upstream: loudness buys
+influence, the *arrangement* decides the sign, and no descriptor here captures arrangement.
+
+### How to read each figure
+
+`figures/head_properties_projected_seed42/`
+
+**`01_property_ranking`** — y: the 14 properties. x: Spearman ρ between the property
+(across 184 heads) and those heads' ΔAUROC, **averaged over the 7 datasets**; the grey
+line is the min–max range across those datasets. Left panel z-scores each property within
+its stage; right panel does not. Blue = higher property means removal helps more, orange =
+hurts more. *Read the line, not the bar*: every property's range straddles zero, so no
+property is consistent across datasets. Bars ≤ 0.08 are negligible — ρ = 0.07 explains
+about 0.5% of the rank variance.
+
+**`02_generality_vs_effect`** — one point per head (184); shape = stage; y = mean ΔAUROC
+over the 7 datasets from removing that head; x = the property, z-scored within stage. Grey
+line is a least-squares fit, and each panel's title carries the Spearman ρ and its
+uncorrected p. Left is *how loud* the head is, right is *what it is loud on*. The left
+tilts up (ρ = +0.20, p = 0.007 raw, 0.09 after correcting for 14 properties); the right is
+flat (ρ = −0.07, p = 0.4). Loudness relates weakly; domain preference not at all.
+
+**`03_group_profiles`** — y: properties. Two bars each: the top-20 heads by mean effect
+(blue) and the bottom-20 (orange). x: mean z-score within stage, so 0 is the average head
+of the same stage; whiskers are ±1 standard error. Compare each bar to 0 *and* to the
+other bar. Both bars point the same way on the activation properties — that is the
+figure's message: these properties do not discriminate direction. It carries no
+significance test; `05` supplies that.
+
+**`04_stage_confound`** — five panels (four properties and the pruning effect itself),
+each a box plot across the four HTSAT stages. Box = interquartile range, line = median,
+whiskers = 1.5×IQR, outliers hidden. Weight norm climbs 6.8 → 11.7 and OV spectral norm
+0.44 → 2.14 from stage 0 to 3. This is *why* every other statistic is computed within
+stage: without that, "property predicts effect" could be nothing but "stage predicts both".
+
+**`05_selected_vs_rest`** — y: properties. One panel per group: top-3-helps per dataset
+(n = 21 dataset-head rows), top-3-hurts (n = 21), and both pooled (n = 42). x: the group's
+**median z-score within (dataset, stage)** — 0 is an ordinary head from the same dataset
+and stage. The grey band is the central 95% of 10,000 random same-size selections: **a dot
+inside the band is what chance already produces**, a dot outside it is a real shift. A star
+marks survival of Bonferroni correction over all 42 tests. The three starred rows in the
+pooled panel are the finding above.
+
+**`head_features.csv`** has the per-head numbers, `selected_vs_rest.csv` the group tests,
+`property_stats_per_dataset.csv` and `property_stats_mean_effect.csv` the correlations.
 
 ### Why this is not proof that head properties are irrelevant
 
@@ -497,7 +571,215 @@ Everything here that was a judgement call rather than a given:
 10. **AUC groups** are the top/bottom 20 heads by effect (`--group-size`), an arbitrary
     but pre-stated cut.
 
+
+
+## Does head-harmfulness transfer across tasks? (`analyze_transfer.py`, `eval_family_transfer_clap.py`)
+
+Every earlier experiment treated "the same head helps task A and hurts task B" as the
+nuisance that stopped anything correlating. This makes it the measurement. Two tests, one
+free and one cheap:
+
+```bash
+sbatch scripts/analyze-transfer.sh --formats png pdf      # re-analysis, no forward passes
+sbatch scripts/family-transfer-CLAP.sh                    # held-out check, ~9 min
+sbatch scripts/analyze-famtransfer.sh --formats png pdf
+```
+
+Families are anatomical and were fixed before looking at any result: **cardiac** = BMD
+(Mit/Pul/Aor/Tri sites), CinC, CirCor (MV/AV/PV/TV), ZCHSound; **respiratory** = ICBHI,
+KAUH, SPRSound.
+
+### 1. The cross-task correlation matrix — no shared structure
+
+Correlating each dataset's 184-head effect vector against every other's:
+
+- largest |ρ| anywhere is **0.151**; **0 of 21 pairs** survive Bonferroni
+- within-family mean ρ **+0.016** vs across-family **−0.023**, gap +0.039,
+  **exact permutation p = 0.31** over all 35 relabellings
+- the dendrogram does not recover the families — ZCHSound (cardiac) clusters with the
+  respiratory datasets
+
+This is the uniform-near-zero branch. Ranking heads by "removal helps" on one dataset
+tells you essentially nothing about another.
+
+Restricting to each dataset's signal-carrying tail (`05_transfer_matrix.png`: take the
+top-10 heads on A, measure them on B) does not rescue it, and reveals the reason the
+first test looked so flat — **the matrix has a strong column structure, not a block
+structure**. Transfer into ICBHI averages **+0.016** and into KAUH **+0.009** regardless
+of where the heads came from, while transfer into CirCor, BMD and CinC is negative
+regardless. Some datasets simply move upward under almost any head removal.
+
+Controlling for that per-target main effect, 6 of 7 targets do favour same-family
+selection (mean gap +0.004, Wilcoxon p = 0.047, sign test p = 0.125) — but that test was
+run *after* the pooled one failed, and one dataset dominates it. It is a hint, not a
+result.
+
+### 2. The held-out test — selected head sets do not beat random ones
+
+For each target dataset, three sets of 10 heads are chosen **without ever using that
+dataset**, removed all at once, and scored on it; a random 10-head set is the floor.
+
+| target | same family | other family | all others | random (mean of 10) |
+|---|---|---|---|---|
+| BMD | −0.025 | +0.027 | −0.000 | +0.002 |
+| CinC | +0.013 | +0.012 | −0.003 | +0.003 |
+| CirCor | +0.003 | −0.012 | −0.007 | −0.004 |
+| ICBHI | +0.087 | +0.096 | −0.022 | +0.022 |
+| KAUH | −0.043 | −0.043 | +0.012 | +0.004 |
+| SPRSound | −0.012 | −0.013 | −0.023 | −0.002 |
+| ZCHSound | +0.024 | +0.050 | +0.022 | +0.012 |
+| **mean** | **+0.007** | **+0.017** | **−0.003** | **+0.005** |
+
+Within-target paired tests: same-vs-other family **4/7, p = 0.69**; same-family vs random
+**4/7, p = 0.94**; universal vs random **2/7, p = 0.47**. In `01_transfer_per_target.png`
+essentially every selected set lands **inside** the random band.
+
+**Head sets selected on other datasets transfer no better than random head sets** — not
+within family, not universally.
+
+### 3. The control this project had been missing
+
+The random condition is the first time a *k*-head removal was compared against removing
+*k* arbitrary heads on the same dataset, and it is sobering:
+
+| dataset | ΔAUROC from 10 random heads |
+|---|---|
+| ICBHI | **+0.022 ± 0.049** (range −0.052 … +0.097) |
+| ZCHSound | +0.012 ± 0.015 |
+| KAUH | +0.004 ± 0.027 |
+| CirCor | −0.004 ± 0.014 |
+
+ICBHI's k-NN AUROC moves by up to ±0.10 when ten *arbitrary* heads are deleted. So a large
+part of what the sweep recorded as "removing this head helps ICBHI" is **ICBHI's
+susceptibility to almost any perturbation**, not a property of the head.
+
+**How this squares with the shuffle control.** That experiment showed that destroying a
+*specific* head's arrangement reproduces its removal effect (r = +0.97). That remains
+true — but it was measured on the same fixed test split, and a susceptible dataset would
+reproduce it too: any similar perturbation of the same head moves the same split the same
+way. The control established the effect is a reproducible function of
+**(head, dataset, split)**; it never established it generalises beyond that split, and
+this experiment shows it does not generalise across datasets.
+
+**What would settle it**: re-run the sweep under a different train/test split (or bootstrap
+the test set) and correlate the two effect vectors *within* each dataset. That separates
+split-specific movement from a real head-by-dataset interaction, and costs about one more
+sweep (~45 min). Until that is done, the per-head effects should be described as
+split-specific, and the strong claims in the sections above should be read with the random
+floor in mind.
+
+
+
+
+
+
+## Split-stability: does the per-head effect replicate? (`--split-direction reverse`)
+
+The transfer experiments left one question load-bearing: is "this head helps this dataset"
+a property of the (head, dataset) pair, or of the particular recordings that happened to be
+scored? This settles it using only the splits the repo already has, by swapping their roles:
+
+```bash
+sbatch scripts/prune-CLAP.sh --prune_type none --split-direction reverse --batch-size 64
+sbatch --time=01:00:00 scripts/prune-CLAP.sh --prune_type head --split-direction reverse --batch-size 64
+sbatch scripts/analyze-splitstab.sh --formats png pdf
+```
+
+| direction | k-NN fitted on | scored on |
+|---|---|---|
+| forward | train | test |
+| reverse | test | train |
+
+No new split is invented and no new embedding is computed — the same cached features are
+reused and only the classifier's roles change. The two AUROCs are therefore measured on
+**disjoint recordings**, which is what makes the comparison a replication test.
+
+### Result: the effect vectors barely agree
+
+| dataset | ρ (all 184 heads) | p | ρ (forward extremes) |
+|---|---|---|---|
+| SPRSound | +0.260 | 0.0004 | +0.396 |
+| KAUH | +0.224 | 0.002 | +0.275 |
+| CirCor | +0.195 | 0.008 | +0.388 |
+| ICBHI | +0.088 | 0.23 | +0.036 |
+| BMD | +0.061 | 0.41 | +0.120 |
+| ZCHSound | +0.059 | 0.42 | +0.098 |
+| CinC | −0.055 | 0.46 | −0.117 |
+
+Mean ρ **+0.119**, median +0.088. Only **3 of 7** clear the |ρ| > 0.146 needed to be
+distinguishable from zero at n = 184, and none comes near the ρ > 0.5 that would mark a
+stable head×task interaction. Correlations are attenuated by noise in either direction, so
+these are lower bounds — but they are nowhere near the bar.
+
+### The decisive read: what survives, in AUROC units
+
+Take the 10 heads the forward split calls most helpful, read them on the reverse split,
+and compare against the mean of random 10-head sets drawn from the same reverse column
+(10,000 draws). Selection uses forward only, so the reverse column is out of sample.
+
+| dataset | forward "helps" | reverse | above random floor | survives | p |
+|---|---|---|---|---|---|
+| ICBHI | **+0.0719** | +0.0034 | +0.0078 | 11% | 0.060 |
+| KAUH | +0.0384 | +0.0014 | +0.0021 | 6% | 0.28 |
+| BMD | +0.0257 | −0.0068 | −0.0012 | — | 0.72 |
+| ZCHSound | +0.0189 | −0.0017 | −0.0004 | — | 0.64 |
+| CirCor | +0.0108 | −0.0004 | +0.0029 | 27% | 0.046 |
+| CinC | +0.0085 | +0.0015 | +0.0003 | 4% | 0.30 |
+| SPRSound | +0.0085 | +0.0011 | −0.0000 | 0% | 0.53 |
+
+**"Removal helps" does not replicate.** ICBHI's headline +0.072 becomes +0.003 — about a
+tenth of it, and not significant. One dataset of seven reaches p < 0.05 uncorrected, none
+after correcting for the 14 tests. The gains were a winner's curse: heads selected because
+they moved *those* recordings.
+
+The other side behaves differently:
+
+| dataset | forward "hurts" | reverse | above floor | survives | p |
+|---|---|---|---|---|---|
+| SPRSound | −0.0083 | −0.0049 | −0.0060 | 72% | **0.0004** |
+| CirCor | −0.0236 | −0.0082 | −0.0049 | 21% | **0.003** |
+| KAUH | −0.0178 | −0.0080 | −0.0072 | 41% | 0.040 |
+| BMD | −0.0394 | −0.0109 | −0.0054 | 14% | 0.012 |
+| ZCHSound | −0.0054 | −0.0012 | +0.0001 | — | 0.55 |
+| CinC | −0.0134 | +0.0023 | +0.0010 | — | 0.94 |
+| ICBHI | −0.0157 | +0.0029 | +0.0072 | — | 0.92 |
+
+**"Removal hurts" partially replicates**: 4 of 7 datasets at p < 0.05, and SPRSound and
+CirCor survive Bonferroni over all 14 tests. Heads that carry pathology signal keep
+costing AUROC when deleted, on recordings never used to pick them.
+
+### What this means for the claims
+
+The honest, narrower statement the evidence supports:
+
+- **There are heads whose removal reliably damages a given task.** That replicates
+  out-of-sample on 4 of 7 datasets and is a genuine head×task interaction.
+- **There are no heads whose removal reliably improves the probe.** Every such gain
+  measured here is split-specific. The earlier "removing this head helps ICBHI by 0.07"
+  is not a property of the head.
+- This retro-explains the two preceding experiments. Family transfer failed because the
+  sets were built from "helps" heads, i.e. from noise. And the shuffle control's r = +0.97
+  was measured on the fixed forward split — it showed the effect is a reproducible function
+  of (head, dataset, split), exactly as flagged, and the split term turns out to dominate
+  on the helps side.
+- The **arrangement** result still stands as stated: scrambling a head reproduces its
+  removal effect, whatever that effect is. It was never evidence that the effect
+  generalises.
+
+Anything written up should lead with the harmful direction, quote out-of-sample numbers
+from the reverse split rather than the forward selection, and drop the pruning-gain
+framing entirely.
+
+**Figures** (`figures/split_stability_projected_seed42/`): `01_split_scatter` is one panel
+per dataset, each head's forward effect against its reverse effect with the extremes
+highlighted — the diagonal is perfect agreement, and the clouds are round.
+`02_split_rho` ranks the ρ values against the n = 184 significance band. `03_extreme_readout`
+pairs each selection with its out-of-sample re-read. `04_effect_survival` is the table
+above in AUROC units, with the random-head floor marked and stars for p < 0.05.
+
 ---
+
+<!-- ---
 
 ## Final Remarks
 
@@ -511,4 +793,4 @@ Following datasets should not be included in the experiments which are already e
 
 - HFLUNG_Cycle
 
-- ICBHI_Cycle
+- ICBHI_Cycle -->

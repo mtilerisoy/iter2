@@ -197,6 +197,13 @@ def build_arg_parser():
     parser.add_argument("--model", default=ClapBackbone.default_model_id)
     parser.add_argument("-k", "--k", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--split-direction", choices=("forward", "reverse"), default="forward",
+        help="'forward' fits the k-NN on train and scores test (the standard protocol). "
+             "'reverse' swaps the two roles, using the same two groups of recordings, so "
+             "the AUROC is measured on recordings the forward run never scored. Nothing "
+             "else changes and no new split is invented.",
+    )
     parser.add_argument("--clip-seconds", type=int, default=ClapBackbone.default_clip_seconds)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -255,12 +262,15 @@ def main():
 
     units = prune_units(backbone.model, args.prune_type)
     print(f"Pruning sweep: {args.prune_type} ({len(units)} configuration(s))")
+    print(f"Split direction: {args.split_direction}"
+          + ("  (k-NN fitted on test, scored on train)" if args.split_direction == "reverse" else ""))
 
     entries = load_entries(args.config, args.datasets)
 
+    direction_tag = "" if args.split_direction == "forward" else "_reverse"
     output = Path(
         args.output
-        or f"results/prune_clap_{args.prune_type}_{args.pooling}_seed{args.seed}.csv"
+        or f"results/prune_clap_{args.prune_type}_{args.pooling}_seed{args.seed}{direction_tag}.csv"
     )
     handle, writer, done = open_csv(output, args.resume)
     if done:
@@ -307,7 +317,13 @@ def main():
                     train_x = encode_cached(train_batches, backbone)
                     test_x = encode_cached(test_batches, backbone)
 
-                auroc = knn_evaluate(train_x, train_y, test_x, test_y, args.k)["auroc"]
+                # The reverse direction reuses the very same embeddings and only swaps
+                # which split fits the classifier and which one is scored.
+                if args.split_direction == "forward":
+                    fit_x, fit_y, score_x, score_y = train_x, train_y, test_x, test_y
+                else:
+                    fit_x, fit_y, score_x, score_y = test_x, test_y, train_x, train_y
+                auroc = knn_evaluate(fit_x, fit_y, score_x, score_y, args.k)["auroc"]
                 writer.writerow(
                     {
                         "dataset": name,

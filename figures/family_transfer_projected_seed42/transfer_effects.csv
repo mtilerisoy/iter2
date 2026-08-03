@@ -1,0 +1,8 @@
+dataset,family,own_family,other_family,universal,random
+BMD,cardiac,-0.025391,0.027235,-0.000217,0.001530
+CinC,cardiac,0.013133,0.011541,-0.002577,0.002663
+CirCor,cardiac,0.002500,-0.012185,-0.006475,-0.004066
+ICBHI,respiratory,0.086862,0.095750,-0.022139,0.022366
+KAUH,respiratory,-0.042592,-0.042963,0.011482,0.003704
+SPRSound,respiratory,-0.011488,-0.013408,-0.022828,-0.002244
+ZCHSound,cardiac,0.024357,0.049565,0.021881,0.011873
